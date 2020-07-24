@@ -378,62 +378,88 @@ my sub scalar-hash2class(str $name, $type is raw) {
     }
 }
 
+#---------- the actual role to be mixed in -------------------------------------
+
 # Mapper for valid sigils
 my $sigils := nqp::hash('$', 1, '@', 1, '%', 1);
 
-# The actual role that does the work
-role Hash2Class:ver<0.0.6>:auth<cpan:ELIZABETH>[*@list, *%hash] {
+role Hash2Class:ver<0.0.8>:auth<cpan:ELIZABETH>[*@list, *%hash] {
     has $!data;  # the raw data in a Hash
-
-    method !data() is raw { $!data }
 
     # fetch whatever parameters we got
     for (@list, %hash).flat {
         my $sigil;
-        my $name;
+        my $key;
+        my $method;
         my $type;
+        my $why;
 
         if $_ ~~ Pair {
             $sigil := .key.substr(0,1);
-            $name  := .key.substr(1);
-            $type  := .value;
+            $key   := .key.substr(1);
+            with .value {
+                if $_ ~~ Map {
+                    with .<type> {
+                        $type := $_ ~~ Str
+                          ?? ::($_)
+                          !! die "Only type objects can be used to indicate type";
+                    }
+                    else {
+                        $type := $_;
+                    }
+
+                    $method := $_ with .<name>;
+                    $why    := $_ with .<why>;
+                }
+                elsif $_ ~~ Str {
+                    $type := ::($_);
+                }
+                else {
+                    die "Unsupported value for key: $_.raku()";
+                }
+            }
+            else {
+                $type := $_;
+            }
         }
         else {
             $sigil := .substr(0,1);
-            $name  := .substr(1);
+            $key   := .substr(1);
             $type  := Str;
         }
 
         # fix sigilless names
-        unless nqp::existskey($sigils,$sigil) {
-            $name  := $sigil ~ $name;
+        unless $sigil && nqp::existskey($sigils,$sigil) {
+            $key   := $sigil ~ $key;
             $sigil := '$';
         }
 
-        die "Key must have a name." unless $name;
-        die "Already has a method called '$name'"
-          if $?CLASS.^methods.first(*.name eq $name);
+        $method := $key unless $method;
+        die "Key must have a name." unless $key;
+        die "Already has a method called '$method'"
+          if $?CLASS.^methods.first(*.name eq $method);
 
-        my $method := nqp::istype($type,Hash2Class)
+        my &method := nqp::istype($type,Hash2Class)
           ?? $sigil eq '$'
-            ?? scalar-hash2class($name, $type)  # $
+            ?? scalar-hash2class($key, $type)  # $
             !! $sigil eq '@'
-              ?? array-hash2class($name, $type) # @
-              !! hash-hash2class($name, $type)  # %
+              ?? array-hash2class($key, $type) # @
+              !! hash-hash2class($key, $type)  # %
           !! $type.HOW.^name.ends-with('::CoercionHOW')
             ?? $sigil eq '$'
-              ?? scalar-coercer($name, $type)  # $
+              ?? scalar-coercer($key, $type)  # $
               !! $sigil eq '@'
-                ?? array-coercer($name, $type) # @
-                !! hash-coercer($name, $type)  # %
+                ?? array-coercer($key, $type) # @
+                !! hash-coercer($key, $type)  # %
             !! $sigil eq '$'
-              ?? scalar-type($name, $type)  # $
+              ?? scalar-type($key, $type)  # $
               !! $sigil eq '@'
-                ?? array-type($name, $type) # @
-                !! hash-type($name, $type); # %
+                ?? array-type($key, $type) # @
+                !! hash-type($key, $type); # %
 
-        $method.set_name($name);
-        $?CLASS.^add_method($name, $method);
+        &method.set_why($why) if $why;
+        &method.set_name($method);
+        $?CLASS.^add_method($method, &method);
     }
 
     method new(%data) {
@@ -469,11 +495,16 @@ Hash2Class - A role to create class instances out of a Hash
   ] { }
 
   class FBB does Hash2Class[
-    foo        => Str,
+    "foo",
     bar        => Int,
     baz        => UpdateInfo,
     '@bazlist' => UpdateInfo,
     '%bazmap'  => UpdateInfo,
+    zap => {
+      type => Str,
+      name => "zippo",
+      why  => "Because we can",
+    },
   ] { }
 
   my %hash =
@@ -492,11 +523,13 @@ Hash2Class - A role to create class instances out of a Hash
       second => { added => "2020-07-03", changed => "2020-07-04" },
       third  => { added => "2020-07-05", changed => "2020-07-06" },
     },
+    zap => "Groucho",
   ;
 
   my $fbb = FBB.new(%hash);
   dd $fbb.foo;                    # "foo"
   dd $fbb.bar;                    # 42
+  dd $fbb.zippo;                  # "Groucho"
   dd $fbb.bazlist[1].added;       # Date.new("2020-07-01")
   dd $fbb.bazmap<third>.changed;  # Date.new("2020-07-06")
 
@@ -508,7 +541,8 @@ The C<Hash2Class> role allows one to create a class from a parameterization
 of the role.  The parameterization consists of a list of C<Pair>s in which
 the key indicates the name of key in the hash, and the value indicates the
 type the value in the hash is supposed to have, or be coerced to.  The key
-becomes the name of a method accessing that key in the hash.
+becomes the name of a method accessing that key in the hash, unless it is
+overriden in more extensive parameterization.
 
 A key can be prefixed with C<@> to indicate an Array of values in the hash,
 or be prefixed with C<%> to indicate a hash, or C<$> to indicate a scalar
@@ -526,21 +560,50 @@ L<JSON::Fast> module).  But the hash can be created in any manner.
 Values are checked lazily, so no work is done on parts of the hash that
 are not accessed.
 
+=head1 PARAMETERIZATION
+
+There are three modes of parameterization:
+
+=item identifier
+
+Just specifying an identifier (a string of a single word), will create a
+method with the same name, and assume the value is a C<Str>.  For example:
+
+  "foo",
+
+=item identifier => type
+
+A pair consisting of an identifier and a type, will create a method with the
+same name as the identifier, and assume the value is constraint by the given
+type.  For example:
+
+  bar => Int,
+
+The type can also be specified as a string if necessary:
+
+  bar => "Int",
+
+=item identifier => { ... }
+
+A pair consisting of an identifier and a C<Hash> with further parameterization
+values.  For instance:
+
+  zap => {
+    type => Str,
+    name => "zippo",
+    why  => "Because we can",
+  },
+
+Three keys are recognized in such as Hash: C<type> (the type to constrain to),
+C<name> (the name to create the method with, useful in case the key conflicts
+with other methods, such as C<new>), and C<why> (to set the contents of the
+C<.WHY> function on the method object.
+
 =head1 CREATING A CLASS DEFINITION FROM A JSON BLOB
 
 If you have a file with a JSON blob for which you need to create a class
-definition, you can call the C<skeleton> script which is available
-by extracting it with the C<skeleton> routine which writes the code
-to C<stdout>:
-
-=begin code
-use Hash2Code;
-skeleton;  # OUTPUT: ...Raku program lines...
-=end code
-
-
-You call this script
-with the JSON file as the parameter, and it will print a class definition
+definition, you can call the C<h2c-skeleton> script.  You call this script
+with the JSON blob on standard input, and it will print a class definition
 on standard output.
 
 Class names will be selected randomly, but will be consistent within the
